@@ -38,7 +38,8 @@ from starlette.testclient import TestClient  # noqa: E402
 
 from app.db import Database  # noqa: E402
 from app.definitions import DrillError, load_file, parse_definition  # noqa: E402
-from app.engine import Engine, EngineError, now_ts, reduce_events  # noqa: E402
+from app.diagnosis import diagnose_definition  # noqa: E402
+from app.engine import Engine, EngineError, evaluate_trace, now_ts, reduce_events  # noqa: E402
 from app.joints import (  # noqa: E402
     MISSED,
     RELEASED,
@@ -2003,6 +2004,292 @@ async def test_cross_session_write_serialization(eng):
         await eng.end_session(sd)
 
 
+# --------------------------------------------------------------------------- #
+# [14] draft reachability diagnosis: frozen-definition analyzer, adjudication
+#      order parity with settlement, 404/409, strict read-only behaviour
+# --------------------------------------------------------------------------- #
+DIAG = {
+    "id": "diagdrill",
+    "name": "诊断演练",
+    "roles": [
+        {"id": "a", "name": "甲", "invite": "AAA"},
+        {"id": "b", "name": "乙", "invite": "BBB"},
+    ],
+    "stages": [
+        {
+            "id": "s1", "title": "阶段一", "public": "p", "duration": 30,
+            "default_next": "s4",
+            "options": {
+                "a": [{"id": "go", "text": "去s2", "next": "s2"},
+                      {"id": "wait", "text": "等待"}],
+                "b": [{"id": "ack", "text": "确认", "next": "s5"},
+                      {"id": "pass", "text": "跳过", "next": "s3"},
+                      {"id": "abstain", "text": "弃权"}],
+            },
+            "transitions": [
+                {"when": {"a": "wait"}, "next": "s3"},                      # live
+                {"when": {"a": "wait", "b": "pass"}, "next": "s4"},         # shadowed by option b/pass
+                {"when": {"a": "wait", "b": "abstain"}, "next": "s4"},      # shadowed by transition #0
+                {"when": {"a": "go"}, "next": "s4"},                        # shadowed by option a/go
+                {"when": {"a": "nope"}, "next": "s4"},                      # unmatchable option
+            ],
+        },
+        {
+            "id": "s2", "title": "阶段二", "public": "p", "duration": 30,
+            "default_next": "s5",
+            "options": {"a": [{"id": "back", "text": "回一", "next": "s1"},
+                              {"id": "fwd", "text": "前进"}]},
+            "transitions": [{"when": {"b": "ack"}, "next": "s1"}],          # b does not decide here
+        },
+        {
+            "id": "s3", "title": "阶段三", "public": "p", "duration": None,
+            "default_next": None,
+            "options": {"b": [{"id": "done", "text": "完成"}]},
+        },
+        {
+            "id": "s4", "title": "阶段四", "public": "p", "duration": 30,
+            "default_next": "s4",                                            # self-loop: no exit
+            "options": {"a": [{"id": "stay", "text": "留下", "next": "s4"}]},
+        },
+        {
+            "id": "s5", "title": "阶段五", "public": "p", "duration": 30,
+            "default_next": None,
+            "options": {"a": [{"id": "fin", "text": "结束"}]},
+        },
+        {
+            "id": "s6", "title": "孤岛", "public": "p", "duration": 30,
+            "default_next": None,
+            "options": {"a": [{"id": "x", "text": "X"}]},
+        },
+    ],
+}
+
+# A stage whose default jump can never happen: the two transitions cover
+# "submitted x" and "did not submit" (null when), so s3 stays unreachable.
+DIAG3 = {
+    "id": "diag3",
+    "name": "默认不可达",
+    "roles": [{"id": "a", "name": "甲", "invite": "AAA"}],
+    "stages": [
+        {
+            "id": "s1", "title": "一", "public": "p", "duration": 30,
+            "default_next": "s3",
+            "options": {"a": [{"id": "x", "text": "X"}]},
+            "transitions": [{"when": {"a": None}, "next": "s2"},
+                            {"when": {"a": "x"}, "next": "s2"}],
+        },
+        {
+            "id": "s2", "title": "二", "public": "p", "duration": None,
+            "default_next": None,
+            "options": {"a": [{"id": "k", "text": "K"}]},
+        },
+        {
+            "id": "s3", "title": "三", "public": "p", "duration": None,
+            "default_next": None,
+            "options": {"a": [{"id": "k", "text": "K"}]},
+        },
+    ],
+}
+
+
+def test_draft_diagnosis_analysis():
+    print("[14a] 草稿可达性诊断（分析器）")
+    d = parse_definition(yaml.safe_load(yaml.safe_dump(DIAG)))
+    rep = diagnose_definition(d)
+    s = rep["summary"]
+    check("诊断汇总计数", s["stages"] == 6 and s["reachable"] == 5
+          and s["unreachable"] == 1 and s["shadowed_transitions"] == 5
+          and s["no_exit"] == 1 and not s["all_reachable"] and not s["all_can_finish"],
+          json.dumps(s, ensure_ascii=False))
+    stages = {x["id"]: x for x in rep["stages"]}
+    check("初始阶段距离为 0 且路径为空",
+          stages["s1"]["initial"] and stages["s1"]["distance"] == 0
+          and stages["s1"]["path"] == [])
+    # equal-length paths: the explicit option jump (earlier in adjudication /
+    # definition order) wins over transition #0 which also reaches s3
+    p3 = stages["s3"]["path"]
+    check("等长路径按定义顺序选取（显式跳转优先）",
+          len(p3) == 1 and p3[0]["via"] == "option"
+          and [c["option_id"] for c in p3[0]["choices"]] == ["pass"]
+          and p3[0]["next"] == "s3", json.dumps(p3, ensure_ascii=False))
+    # the timeout-only outcome: everyone unsubmitted -> default jump
+    p4 = stages["s4"]["path"]
+    check("未提交情形计入（全员超时走默认跳转）",
+          len(p4) == 1 and p4[0]["via"] == "default" and p4[0]["choices"] == []
+          and {u["role_id"] for u in p4[0]["unsubmitted"]} == {"a", "b"}
+          and p4[0]["next"] == "s4", json.dumps(p4, ensure_ascii=False))
+    p2 = stages["s2"]["path"]
+    check("最短选择路径经显式跳转",
+          len(p2) == 1 and p2[0]["via"] == "option"
+          and [c["option_id"] for c in p2[0]["choices"]] == ["go"]
+          and [u["role_id"] for u in p2[0]["unsubmitted"]] == ["b"])
+    check("不可达阶段", [u["id"] for u in rep["unreachable"]] == ["s6"]
+          and rep["unreachable"][0]["can_finish"] is True)
+    check("无法通向终局（自循环无出口）",
+          [u["id"] for u in rep["no_exit"]] == ["s4"]
+          and rep["no_exit"][0]["reachable"] is True)
+    check("有出口的循环不误报（s1<->s2 均可通向终局）",
+          stages["s1"]["can_finish"] and stages["s2"]["can_finish"])
+    check("不可达阶段不算无法通向终局", stages["s6"]["can_finish"] is True)
+
+    shadowed = {(sh["stage_id"], sh["index"]): sh for sh in rep["shadowed_transitions"]}
+    check("遮蔽：被选项显式跳转遮蔽",
+          shadowed[("s1", 1)]["reason"] == "shadowed_by_option"
+          and shadowed[("s1", 1)]["shadowed_by"]["option_id"] == "pass"
+          and shadowed[("s1", 3)]["shadowed_by"]["option_id"] == "go")
+    check("遮蔽：被更早的条件转移遮蔽",
+          shadowed[("s1", 2)]["reason"] == "shadowed_by_transition"
+          and shadowed[("s1", 2)]["shadowed_by"]["index"] == 0)
+    check("遮蔽：条件永远无法成立",
+          shadowed[("s1", 4)]["reason"] == "unmatchable"
+          and shadowed[("s2", 0)]["reason"] == "unmatchable")
+    check("同一草稿重复诊断结果一致", diagnose_definition(d) == rep)
+
+    # null-when: "role did not submit" is a real outcome; transitions can
+    # cover the whole assignment space so the default jump never fires.
+    rep3 = diagnose_definition(parse_definition(yaml.safe_load(yaml.safe_dump(DIAG3))))
+    check("默认跳转被完全覆盖时其目标不可达",
+          [u["id"] for u in rep3["unreachable"]] == ["s3"])
+    p32 = {x["id"]: x for x in rep3["stages"]}["s2"]["path"]
+    check("null 条件匹配未提交角色",
+          len(p32) == 1 and p32[0]["via"] == "transition"
+          and p32[0]["transition_index"] == 0 and p32[0]["choices"] == []
+          and [u["role_id"] for u in p32[0]["unsubmitted"]] == ["a"])
+
+    # adjudication parity: several explicit jumps -> first role in the
+    # stage's role configuration order wins (same function settlement uses)
+    s1 = d.stages["s1"]
+    nxt, detail = evaluate_trace(s1, {"a": "go", "b": "ack"})
+    check("多个显式跳转按角色配置顺序取首个",
+          nxt == "s2" and detail == {"via": "option", "role_id": "a", "option_id": "go"})
+    swapped = parse_definition({
+        "id": "diagswap", "name": "换序",
+        "roles": DIAG["roles"],
+        "stages": [{
+            "id": "s1", "title": "一", "public": "p", "duration": 30,
+            "default_next": None,
+            "options": {
+                "b": [{"id": "ack", "text": "确认", "next": "s5"}],
+                "a": [{"id": "go", "text": "去s2", "next": "s2"}],
+            },
+        }] + DIAG["stages"][1:],
+    })
+    nxt2, detail2 = evaluate_trace(swapped.stages["s1"], {"a": "go", "b": "ack"})
+    check("角色配置顺序变化后首个显式跳转随之变化",
+          nxt2 == "s5" and detail2["role_id"] == "b")
+
+
+def test_draft_diagnosis_http():
+    print("[14b] 草稿可达性诊断 HTTP API")
+    with TestClient(app) as client:
+        check("诊断接口需主持人密钥",
+              client.get("/api/drills/diagdrill/versions/1/diagnosis").status_code == 401)
+
+        r = client.post("/api/drills", headers=HOST,
+                        json={"yaml": _dump(DIAG), "base_version": None})
+        check("保存诊断剧本草稿 v1", r.status_code == 200 and r.json()["version"] == 1
+              and r.json()["status"] == "draft")
+
+        r = client.get("/api/drills/diagdrill/versions/1/diagnosis", headers=HOST)
+        check("草稿诊断 200", r.status_code == 200)
+        rep = r.json()
+        check("诊断报告标识与版本元数据",
+              rep["kind"] == "draft_reachability" and rep["drill_id"] == "diagdrill"
+              and rep["version"] == 1 and rep["status"] == "draft"
+              and len(rep["sha256"]) == 64)
+        s = rep["summary"]
+        check("HTTP 诊断汇总计数",
+              s["stages"] == 6 and s["reachable"] == 5 and s["unreachable"] == 1
+              and s["shadowed_transitions"] == 5 and s["no_exit"] == 1)
+        stages = {x["id"]: x for x in rep["stages"]}
+        check("HTTP 最短路径与未提交情形",
+              stages["s4"]["path"][0]["via"] == "default"
+              and stages["s3"]["path"][0]["choices"][0]["option_id"] == "pass")
+        check("HTTP 不可达与无法通向终局",
+              [u["id"] for u in rep["unreachable"]] == ["s6"]
+              and [u["id"] for u in rep["no_exit"]] == ["s4"])
+        check("HTTP 被遮蔽转移带原因",
+              len(rep["shadowed_transitions"]) == 5
+              and all(sh["reason_label"] for sh in rep["shadowed_transitions"]))
+        check("重复请求诊断结果一致",
+              client.get("/api/drills/diagdrill/versions/1/diagnosis",
+                         headers=HOST).json() == rep)
+
+        check("版本不存在返回 404",
+              client.get("/api/drills/diagdrill/versions/99/diagnosis",
+                         headers=HOST).status_code == 404)
+        check("剧本不存在返回 404",
+              client.get("/api/drills/no-such-drill/versions/1/diagnosis",
+                         headers=HOST).status_code == 404)
+
+        # read-only: the version list must be byte-identical after diagnoses
+        before = client.get("/api/drills/diagdrill/versions", headers=HOST).json()
+        client.get("/api/drills/diagdrill/versions/1/diagnosis", headers=HOST)
+        after = client.get("/api/drills/diagdrill/versions", headers=HOST).json()
+        check("诊断不改动任何版本", before == after)
+
+        # publish v1, then it is no longer a draft -> 409
+        r = client.post("/api/drills/diagdrill/versions/1/publish",
+                        headers=HOST, json={"base_version": None})
+        check("发布 v1", r.status_code == 200)
+        check("已发布版本诊断返回 409",
+              client.get("/api/drills/diagdrill/versions/1/diagnosis",
+                         headers=HOST).status_code == 409)
+
+        # a session bound to v1; its replay is the read-only tripwire
+        sid = client.post("/api/sessions", params={"drill_id": "diagdrill"},
+                          headers=HOST).json()["session_id"]
+        client.post(f"/api/sessions/{sid}/join",
+                    json={"invite": "AAA", "name": "甲"})
+        replay_before = client.get(f"/api/sessions/{sid}/replay", headers=HOST).json()
+
+        # edit -> v2 draft; diagnosis works on the new draft
+        v2 = yaml.safe_load(_dump(DIAG))
+        v2["stages"][5]["title"] = "孤岛（改）"
+        r = client.post("/api/drills", headers=HOST,
+                        json={"yaml": _dump(v2), "base_version": 1})
+        check("保存 v2 草稿", r.status_code == 200 and r.json()["version"] == 2)
+        check("v2 草稿诊断 200",
+              client.get("/api/drills/diagdrill/versions/2/diagnosis",
+                         headers=HOST).status_code == 200)
+
+        # optimistic publish lock still enforced after diagnoses
+        r = client.post("/api/drills/diagdrill/versions/2/publish",
+                        headers=HOST, json={"base_version": 99})
+        check("基准冲突发布仍 409", r.status_code == 409)
+        cur = next(x for x in client.get("/api/drills", headers=HOST).json()
+                   if x["id"] == "diagdrill")
+        check("冲突后当前发布版不变", cur["published_version"] == 1
+              and cur["draft_version"] == 2)
+        r = client.post("/api/drills/diagdrill/versions/2/publish",
+                        headers=HOST, json={"base_version": 1})
+        check("v2 正常发布", r.status_code == 200)
+
+        # the session stays pinned to v1 and its replay is untouched
+        srow = next(x for x in client.get("/api/sessions", headers=HOST).json()
+                    if x["id"] == sid)
+        check("会话剧本绑定不受诊断影响", srow["drill_version"] == 1)
+        replay_after = client.get(f"/api/sessions/{sid}/replay", headers=HOST).json()
+        check("诊断后回放逐字节一致", replay_after == replay_before
+              and replay_after["drill_version"] == 1)
+
+        # a superseded draft is not diagnosable either; the open draft is
+        v3 = yaml.safe_load(_dump(v2))
+        v3["stages"][5]["title"] = "孤岛（再改）"
+        client.post("/api/drills", headers=HOST,
+                    json={"yaml": _dump(v3), "base_version": 2})       # v3 draft
+        v4 = yaml.safe_load(_dump(v3))
+        v4["stages"][5]["title"] = "孤岛（终改）"
+        client.post("/api/drills", headers=HOST,
+                    json={"yaml": _dump(v4), "base_version": 2})       # v4 supersedes v3
+        check("被废弃草稿诊断返回 409",
+              client.get("/api/drills/diagdrill/versions/3/diagnosis",
+                         headers=HOST).status_code == 409)
+        check("当前开放草稿诊断 200",
+              client.get("/api/drills/diagdrill/versions/4/diagnosis",
+                         headers=HOST).status_code == 200)
+
+
 async def engine_tests():
     db = Database(str(Path(_TMP) / "t.db"))
     await db.connect()
@@ -2036,6 +2323,8 @@ def main():
     test_http_ws_e2e()
     test_http_version_api()
     test_joint_http_ws()
+    test_draft_diagnosis_analysis()
+    test_draft_diagnosis_http()
     print(f"\n{'全部通过' if FAIL == 0 else '存在失败'}: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

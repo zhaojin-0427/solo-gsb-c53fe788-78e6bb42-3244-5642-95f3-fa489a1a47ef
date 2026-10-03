@@ -97,6 +97,36 @@ def find_option(stage: Stage, role_id: str, choice_id: str) -> Option | None:
     return None
 
 
+def evaluate_trace(
+    stage: Stage, choices: dict[str, str | None]
+) -> tuple[str | None, dict[str, Any]]:
+    """Decide the next stage id AND report which rule won.
+
+    The adjudication order is exactly the one used at settlement time:
+
+    1. an explicit ``next`` on a submitted option wins; when several roles
+       submit options carrying explicit jumps, the first role in the stage's
+       role configuration order decides;
+    2. otherwise the first conditional transition (YAML order) whose ``when``
+       is fully satisfied wins;
+    3. otherwise ``default_next`` (``None`` ends the drill).
+
+    The draft reachability diagnosis calls this very function so its analysis
+    can never drift from the settlement semantics.
+    """
+    for role_id, olist in stage.options.items():
+        cid = choices.get(role_id)
+        if cid is not None:
+            opt = find_option(stage, role_id, cid)
+            if opt is not None and opt.next is not None:
+                return opt.next, {"via": "option", "role_id": role_id, "option_id": opt.id}
+
+    for i, t in enumerate(stage.transitions):
+        if all(choices.get(role) == want for role, want in t.when.items()):
+            return t.next, {"via": "transition", "index": i}
+    return stage.default_next, {"via": "default"}
+
+
 def evaluate(stage: Stage, choices: dict[str, str | None]) -> str | None:
     """Decide the next stage id from sealed choices.
 
@@ -104,17 +134,7 @@ def evaluate(stage: Stage, choices: dict[str, str | None]) -> str | None:
     conditional transitions (first fully matching wins), then default_next.
     ``None`` means the drill ends.
     """
-    for role_id, olist in stage.options.items():
-        cid = choices.get(role_id)
-        if cid is not None:
-            opt = find_option(stage, role_id, cid)
-            if opt is not None and opt.next is not None:
-                return opt.next
-
-    for t in stage.transitions:
-        if all(choices.get(role) == want for role, want in t.when.items()):
-            return t.next
-    return stage.default_next
+    return evaluate_trace(stage, choices)[0]
 
 
 @dataclass
@@ -521,6 +541,36 @@ class Engine:
         old_d = def_from_json(json.loads(rows[from_version]["definition"]))
         new_d = def_from_json(json.loads(rows[to_version]["definition"]))
         return diff_definitions(old_d, new_d)
+
+    async def diagnose_draft(self, drill_id: str, version: int) -> dict[str, Any]:
+        """Read-only reachability diagnosis of a *draft* version.
+
+        The frozen definition stored on the version row is the only input;
+        nothing is written — no events, no version rows, no pointer changes —
+        so the publish optimistic lock, session bindings and replays are all
+        unaffected. 404 when the version does not exist, 409 when it exists
+        but is not an open draft.
+        """
+        from .diagnosis import diagnose_definition  # local: diagnosis imports engine
+
+        row = await self._get_version_row(drill_id, version)
+        if row is None:
+            raise EngineError(f"版本 v{version} 不存在", 404)
+        if row["status"] != "draft":
+            raise EngineError(
+                f"只有草稿版本可以做可达性诊断（v{version} 当前状态为 {row['status']}）",
+                409,
+            )
+        d = def_from_json(json.loads(row["definition"]))
+        report = diagnose_definition(d)
+        report.update({
+            "drill_id": drill_id,
+            "version": row["version"],
+            "status": row["status"],
+            "sha256": row["sha256"],
+            "digest_short": (row["sha256"] or "")[:12],
+        })
+        return report
 
     async def seed_from_file(self, d: DrillDef, yaml_text: str) -> None:
         """Startup reconciliation of a YAML shipped in the drills directory.

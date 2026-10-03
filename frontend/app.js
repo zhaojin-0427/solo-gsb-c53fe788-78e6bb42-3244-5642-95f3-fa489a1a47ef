@@ -1480,6 +1480,10 @@ async function drillVersionPage(drillId) {
       </div>
       <div id="diff-out" style="margin-top:12px"></div>
     </div>
+    <div class="card" id="diag-card">
+      <h2>草稿可达性诊断</h2>
+      <div id="diag-out"></div>
+    </div>
     <div class="card">
       <h2>版本列表</h2>
       <div id="version-list"></div>
@@ -1538,6 +1542,28 @@ async function drillVersionPage(drillId) {
     } catch (e) { out.innerHTML = `<p class="chip danger">${esc(e.message)}</p>`; }
   };
 
+  // draft reachability diagnosis wiring (read-only server-side analysis)
+  const diagOut = root.querySelector("#diag-out");
+  const loadDiagnosis = async (version, scroll) => {
+    diagOut.innerHTML = '<p class="muted small">诊断中…</p>';
+    try {
+      const rep = await api(
+        `/api/drills/${encodeURIComponent(drillId)}/versions/${version}/diagnosis`,
+        { host: true });
+      diagOut.innerHTML = "";
+      diagOut.appendChild(renderDiagnosis(rep));
+    } catch (e) {
+      diagOut.innerHTML = `<p class="chip danger">${esc(e.message)}</p>`;
+    }
+    if (scroll) document.getElementById("diag-card").scrollIntoView({ behavior: "smooth" });
+  };
+  if (draft) {
+    loadDiagnosis(draft.version, false);
+  } else {
+    diagOut.innerHTML = '<p class="muted small">当前没有开放草稿。保存草稿后，这里会自动显示' +
+      '可达阶段的最短选择路径、不可达阶段、被遮蔽的条件转移与无法通向终局的阶段。</p>';
+  }
+
   // version list
   const vl = root.querySelector("#version-list");
   for (const v of versions) {
@@ -1551,6 +1577,7 @@ async function drillVersionPage(drillId) {
         <span class="spacer"></span>
         <button class="ghost" data-act="yaml">查看 YAML</button>
         <button class="ghost" data-act="diff-prev">与上一版对比</button>
+        ${v.status === "draft" ? '<button class="ghost" data-act="diagnose">🔍 诊断</button>' : ""}
         ${v.status === "history" || v.status === "published" || v.status === "superseded"
           ? '<button class="ghost" data-act="copy">复制为新草稿</button>' : ""}
         ${v.status === "draft" ? '<button data-act="publish">▶ 发布此草稿</button>' : ""}
@@ -1561,6 +1588,8 @@ async function drillVersionPage(drillId) {
     </div>`);
 
     row.querySelector('[data-act="yaml"]').onclick = () => showYaml(drillId, v, root);
+    const diagBtn = row.querySelector('[data-act="diagnose"]');
+    if (diagBtn) diagBtn.onclick = () => loadDiagnosis(v.version, true);
     const prevBtn = row.querySelector('[data-act="diff-prev"]');
     prevBtn.onclick = async () => {
       const earlier = versions.find((x) => x.version === v.version - 1);
@@ -1615,6 +1644,111 @@ function showYaml(drillId, v, root) {
     <div class="row"><button class="ghost" id="hide-yaml">收起</button></div>`;
   card.querySelector("#hide-yaml").onclick = () => { card.hidden = true; };
   card.scrollIntoView({ behavior: "smooth" });
+}
+
+// ---- draft reachability diagnosis rendering ----
+function diagStepHtml(step) {
+  const who = step.choices.length
+    ? step.choices.map((c) => `${esc(c.role_name)} 选「${esc(c.option_text)}」`).join("，")
+    : "所有决策角色均未提交（超时/手动结算）";
+  const rest = step.choices.length && step.unsubmitted.length
+    ? `；${step.unsubmitted.map((u) => `${esc(u.role_name)} 未提交`).join("，")}`
+    : "";
+  return `在「${esc(step.stage_title)}」：${who}${rest}
+    <span class="diag-via">─ ${esc(step.via_label)} →</span> 「${esc(step.next_label)}」`;
+}
+
+function renderDiagStage(st) {
+  const box = el(`<div class="box">
+    <div class="row">
+      <strong>「${esc(st.title)}」</strong>
+      <span class="chip mono">${esc(st.id)}</span>
+      ${st.initial ? '<span class="chip host">初始阶段</span>'
+                   : `<span class="chip">最短 ${st.distance} 步</span>`}
+      ${st.can_finish ? '<span class="chip ok">可通向终局</span>'
+                      : '<span class="chip danger">无法通向终局</span>'}
+    </div>
+    <div class="diag-path"></div>
+  </div>`);
+  const p = box.querySelector(".diag-path");
+  if (!st.path || !st.path.length) {
+    p.innerHTML = '<div class="muted small">演练从这里开始，无需任何选择。</div>';
+  } else {
+    st.path.forEach((step, i) => {
+      p.appendChild(el(`<div class="diag-step"><span class="mono muted">${i + 1}.</span> ${diagStepHtml(step)}</div>`));
+    });
+  }
+  return box;
+}
+
+function renderDiagnosis(rep) {
+  const s = rep.summary;
+  const wrap = el(`<div>
+    <div class="row">
+      <span class="chip host">草稿 v${rep.version}</span>
+      <span class="chip mono" title="SHA-256 内容摘要">${esc(rep.digest_short)}</span>
+      <span class="chip ${s.unreachable ? "danger" : "ok"}">不可达阶段 ${s.unreachable}</span>
+      <span class="chip ${s.shadowed_transitions ? "warn" : "ok"}">被遮蔽转移 ${s.shadowed_transitions}</span>
+      <span class="chip ${s.no_exit ? "danger" : "ok"}">无法通向终局 ${s.no_exit}</span>
+    </div>
+    <p class="muted small">
+      对草稿 v${rep.version} 的冻结定义做只读分析（不写事件、不改版本），裁决顺序与实际结算一致：
+      角色选项的显式跳转优先（多个按阶段角色配置顺序取首个）→ 条件转移按 YAML 顺序首个命中 →
+      默认跳转；角色未提交（超时）也计入。等长路径按定义顺序选取，有出口的循环不会误报。
+    </p>
+    <div id="diag-body"></div>
+  </div>`);
+  const body = wrap.querySelector("#diag-body");
+
+  body.appendChild(el(`<h3>可达阶段的最短选择路径（${s.reachable}/${s.stages}）</h3>`));
+  for (const st of rep.stages.filter((x) => x.reachable)) {
+    body.appendChild(renderDiagStage(st));
+  }
+
+  body.appendChild(el(`<h3>不可达阶段（${s.unreachable}）</h3>`));
+  if (!rep.unreachable.length) {
+    body.appendChild(el('<p class="muted small">无：从初始阶段出发，所有阶段都可到达。</p>'));
+  } else {
+    const box = el('<div class="box"><div class="row"></div></div>');
+    const row = box.querySelector(".row");
+    for (const u of rep.unreachable) {
+      row.appendChild(el(`<span class="chip danger" title="任何选择组合都无法到达此阶段">
+        「${esc(u.title)}」${u.can_finish ? "" : "（也无法通向终局）"}</span>`));
+    }
+    body.appendChild(box);
+    body.appendChild(el('<p class="muted small">提示：检查指向这些阶段的显式跳转、条件转移与默认跳转是否被遮蔽或缺失。</p>'));
+  }
+
+  body.appendChild(el(`<h3>被遮蔽的条件转移（${s.shadowed_transitions}）</h3>`));
+  if (!rep.shadowed_transitions.length) {
+    body.appendChild(el('<p class="muted small">无：每条条件转移都可能命中。</p>'));
+  } else {
+    for (const sh of rep.shadowed_transitions) {
+      const when = Object.entries(sh.when)
+        .map(([r, w]) => `${esc(r)}=${w == null ? "未提交" : esc(w)}`).join("，");
+      body.appendChild(el(`<div class="box">
+        <div class="row">
+          <strong>「${esc(sh.stage_title)}」条件转移 #${sh.index}</strong>
+          <span class="chip mono">当 ${when} → ${sh.next == null ? "演练结束" : esc(sh.next)}</span>
+        </div>
+        <div class="block-reason">${esc(sh.reason_label)}</div>
+      </div>`));
+    }
+  }
+
+  body.appendChild(el(`<h3>无法通向终局的阶段（${s.no_exit}）</h3>`));
+  if (!rep.no_exit.length) {
+    body.appendChild(el('<p class="muted small">无：从任一阶段出发，演练都能走向终局。</p>'));
+  } else {
+    const box = el('<div class="box"><div class="row"></div></div>');
+    const row = box.querySelector(".row");
+    for (const u of rep.no_exit) {
+      row.appendChild(el(`<span class="chip danger">「${esc(u.title)}」${u.reachable ? "" : "（不可达）"}</span>`));
+    }
+    body.appendChild(box);
+    body.appendChild(el('<p class="muted small">提示：这些阶段的所有出口都只在死循环内打转，演练进入后将永远无法结束。</p>'));
+  }
+  return wrap;
 }
 
 // ---- structured diff rendering ----

@@ -173,6 +173,11 @@ label select { display: block; margin-top: 4px; min-width: 220px; }
   font-size: .82rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
 
+/* ---- draft reachability diagnosis ---- */
+.diag-path { margin-top: 8px; }
+.diag-step { font-size: .87rem; margin: 5px 0; line-height: 1.6; }
+.diag-via { color: var(--muted); font-size: .8rem; margin: 0 4px; }
+
 /* ---- joint exercise orchestration ---- */
 .joint-members table { font-size: .85rem; }
 .gate { border-left: 4px solid #314070; }

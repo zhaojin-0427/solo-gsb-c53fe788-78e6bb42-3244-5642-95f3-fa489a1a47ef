@@ -398,6 +398,28 @@ async def api_diff(
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
+@app.get("/api/drills/{drill_id}/versions/{version}/diagnosis")
+async def api_draft_diagnosis(
+    drill_id: str,
+    version: int,
+    x_host_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Draft reachability diagnosis (host only, strictly read-only).
+
+    Reads the draft version's frozen definition and reports reachable stages
+    with shortest choice paths, unreachable stages, shadowed conditional
+    transitions and stages that can never reach the end — using the same
+    adjudication order as settlement. 404 when the version does not exist,
+    409 when it is not an open draft. No events are written and no version
+    state changes, so publishing, session bindings and replays are untouched.
+    """
+    check_host(x_host_key)
+    try:
+        return await engine.diagnose_draft(drill_id, version)
+    except EngineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
 @app.post("/api/sessions")
 async def api_create_session(
     drill_id: str = Query(...), x_host_key: str | None = Header(default=None)
